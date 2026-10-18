@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 
 use riperf3::{ClientBuilder, RiperfError, TransportProtocol};
 
+mod libiperf;
+
 pub struct Iperf3Command<S: AsRef<str>> {
     server: S,
     duration_s: u32,

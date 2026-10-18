@@ -10,3 +10,7 @@ thiserror = "2.0.21"
 
 riperf3 = { git = "https://github.com/drew-buckley/riperf3.git", branch = "no-stdout" }
 tokio = { version = "1", features = ["full"] }
+anyhow = "1.0.104"
+
+[build-dependencies]
+pkg-config = "0.3.34"

@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "argh"
 version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -167,8 +173,10 @@ dependencies = [
 name = "geoperf"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "argh",
  "log",
+ "pkg-config",
  "riperf3",
  "thiserror",
  "tokio",
@@ -397,6 +405,12 @@ dependencies = [
  "der",
  "spki",
 ]
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "ppv-lite86"
