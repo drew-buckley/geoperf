@@ -1,0 +1,12 @@
+[package]
+name = "geoperf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argh = "0.1.19"
+log = "0.4.34"
+thiserror = "2.0.21"
+
+riperf3 = { git = "https://github.com/drew-buckley/riperf3.git", branch = "no-stdout" }
+tokio = { version = "1", features = ["full"] }
