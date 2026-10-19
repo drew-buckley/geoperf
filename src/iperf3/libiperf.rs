@@ -1,5 +1,5 @@
 use std::{
-    ffi::{CStr, CString, c_char, c_double, c_int, c_schar},
+    ffi::{CStr, CString, c_char},
     ptr::NonNull,
     str::Utf8Error,
     sync::mpsc,
@@ -8,6 +8,8 @@ use std::{
 
 use anyhow::Context;
 use libffi::high::ClosureMut2;
+
+use crate::iperf3::libiperf::event::IperfEvent;
 
 pub struct IperfTest {
     test_ptr: NonNull<bind::IperfTest>,
@@ -35,7 +37,7 @@ impl IperfTest {
     pub fn set_test_role(&self, role: TestRole) {
         // SAFETY: test_ptr is NonNull, allocated in new, and only freed on drop
         unsafe {
-            bind::iperf_set_test_role(self.test_ptr.as_ptr(), role.as_c_char());
+            bind::iperf_set_test_role(self.test_ptr.as_ptr(), role.into());
         }
     }
 
@@ -87,8 +89,17 @@ impl IperfTest {
         }
     }
 
-    pub fn exec(mut self) -> Result<(), error::IperfTestError> {
-        let event_tx = self.event_tx.take().unwrap_or_else(|| mpsc::channel().0);
+    pub fn exec(mut self) -> Result<Vec<IperfEvent>, error::IperfTestError> {
+        let mut event_rx = None;
+        let event_tx = match self.event_tx.take() {
+            Some(tx) => tx,
+            None => {
+                let (tx, rx) = mpsc::channel();
+                event_rx = Some(rx);
+                tx
+            }
+        };
+
         let mut event_callback = move |_t: *mut bind::IperfTest, json: *mut c_char| {
             if !json.is_null() {
                 let _ = event_tx.send(
@@ -102,7 +113,17 @@ impl IperfTest {
             ClosureMut2::new(&mut event_callback);
 
         // `self` should drop before `event_callback`
-        self.exec_inner(&event_callback)
+        self.exec_inner(&event_callback)?;
+
+        let mut events = if let Some(event_rx) = event_rx {
+            let res: Result<Vec<String>, Utf8Error> = event_rx.iter().collect();
+            // res.map_err(|e| error::IperfTestError::)?.iter().map(|s| serde_json::from_str(s));
+            todo!()
+        } else {
+            Vec::new()
+        };
+
+        Ok(events)
     }
 
     fn exec_inner(
@@ -111,12 +132,15 @@ impl IperfTest {
     ) -> Result<(), error::IperfTestError> {
         // SAFETY: `closure` will be dropped at the end of this function, same as `self`.
         unsafe {
+            bind::iperf_set_test_json_stream(self.test_ptr.as_ptr(), 1);
             bind::iperf_set_test_json_callback(
                 self.test_ptr.as_ptr(),
                 Some(std::mem::transmute(*event_callback.code_ptr())),
             );
             if bind::iperf_run_client(self.test_ptr.as_ptr()) < 0 {
-                i_errno_result().map_err(error::IperfTestError::Execution)?;
+                return Err(error::IperfTestError::Execution(
+                    error::LibiperfError::last(),
+                ));
             }
         };
 
@@ -138,8 +162,8 @@ pub enum TestRole {
     Server,
 }
 
-impl TestRole {
-    pub fn as_c_char(&self) -> c_char {
+impl Into<c_char> for TestRole {
+    fn into(self) -> c_char {
         match self {
             Self::Client => bind::ROLE_CLIENT,
             Self::Server => bind::ROLE_SERVER,
@@ -245,16 +269,9 @@ pub mod event {
     }
 }
 
-pub fn i_errno_result() -> Result<(), bind::error::IperfErrno> {
-    // SAFETY: just a errno global; relax
-    let err_code = unsafe { bind::i_errno };
-    match bind::error::IperfErrno::from_raw(err_code) {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
-}
-
 pub mod error {
+    use std::ffi::CStr;
+
     use crate::iperf3::libiperf::bind;
 
     #[derive(Debug, thiserror::Error)]
@@ -263,7 +280,45 @@ pub mod error {
         DataMarshalling(#[source] anyhow::Error),
 
         #[error("error occurred during test execution")]
-        Execution(#[source] bind::error::IperfErrno),
+        Execution(#[source] Option<LibiperfError>),
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{message}")]
+    pub struct LibiperfError {
+        errno: bind::IperfErrno,
+        message: String,
+    }
+
+    impl LibiperfError {
+        pub(super) fn last() -> Option<Self> {
+            // SAFETY: just an errno variable
+            let Some(errno) = bind::IperfErrno::from_raw(unsafe { bind::i_errno }) else {
+                return None;
+            };
+
+            // SAFETY: static buffer
+            let msg_ptr = unsafe { bind::iperf_strerror(errno.as_raw()) };
+            let message = if msg_ptr.is_null() {
+                format!("libiperf error {}", errno.as_raw())
+            } else {
+                // SAFETY: non-null, null-terminated buffer owned by libiperf
+                unsafe { CStr::from_ptr(msg_ptr) }
+                    .to_string_lossy()
+                    .trim_end()
+                    .to_owned()
+            };
+
+            Some(Self { errno, message })
+        }
+
+        pub fn errno(&self) -> bind::IperfErrno {
+            self.errno
+        }
+
+        pub fn message(&self) -> &str {
+            &self.message
+        }
     }
 }
 
@@ -433,486 +488,318 @@ pub(super) mod bind {
         pub fn iperf_set_test_json_callback(ipt: *mut IperfTest, callback: Option<JsonCallback>);
     }
 
-    pub mod error {
-        use super::*;
+    macro_rules! c_int_enum {
+        (
+            $(#[$attr:meta])*
+            $vis:vis enum $name:ident {
+                $( $(#[$vattr:meta])* $variant:ident = $value:expr, )*
+            }
+        ) => {
+            $(#[$attr])*
+            #[repr(i32)]
+            $vis enum $name {
+                $( $(#[$vattr])* $variant = $value, )*
+            }
 
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
-        #[repr(i32)]
+            impl $name {
+                /// Returns `None` for codes with no matching variant.
+                pub fn from_raw(code: c_int) -> Option<Self> {
+                    #![allow(non_upper_case_globals)]
+                    $( const $variant: c_int = $name::$variant as c_int; )*
+
+                    match code {
+                        $( $variant => Some(Self::$variant), )*
+                        _ => None,
+                    }
+                }
+
+                pub fn as_raw(self) -> c_int {
+                    self as c_int
+                }
+            }
+        };
+    }
+
+    c_int_enum! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum IperfErrno {
-            // Parameter errors
             /// `IESERVCLIENT`
-            #[error("cannot be both server and client")]
             ServerAndClient = 1,
             /// `IENOROLE`
-            #[error("must be either a client (-c) or server (-s)")]
             NoRole = 2,
             /// `IESERVERONLY`
-            #[error("option is server only")]
             ServerOnly = 3,
             /// `IECLIENTONLY`
-            #[error("option is client only")]
             ClientOnly = 4,
             /// `IEDURATION`
-            #[error("test duration out of range")]
             Duration = 5,
             /// `IENUMSTREAMS`
-            #[error("invalid number of parallel streams")]
             NumStreams = 6,
             /// `IEBLOCKSIZE`
-            #[error("block size too large")]
             BlockSize = 7,
             /// `IEBUFSIZE`
-            #[error("socket buffer size too large")]
             BufSize = 8,
             /// `IEINTERVAL`
-            #[error("invalid report interval")]
             Interval = 9,
             /// `IEMSS`
-            #[error("TCP MSS too large")]
             Mss = 10,
             /// `IENOSENDFILE`
-            #[error("this OS does not support sendfile")]
             NoSendfile = 11,
             /// `IEOMIT`
-            #[error("invalid value for --omit")]
             Omit = 12,
             /// `IEUNIMP`
-            #[error("option is not implemented yet")]
             Unimplemented = 13,
             /// `IEFILE`
-            #[error("unable to open -F file")]
             File = 14,
             /// `IEBURST`
-            #[error("invalid burst count")]
             Burst = 15,
             /// `IEENDCONDITIONS`
-            #[error("only one test end condition (-t, -n, -k) may be specified")]
             EndConditions = 16,
             /// `IELOGFILE`
-            #[error("unable to open log file")]
             LogFile = 17,
             /// `IENOSCTP`
-            #[error("no SCTP support available")]
             NoSctp = 18,
             /// `IEBIND`
-            #[error("--bind must be specified to use --cport")]
             Bind = 19,
             /// `IEUDPBLOCKSIZE`
-            #[error("invalid UDP block size")]
             UdpBlockSize = 20,
             /// `IEBADTOS`
-            #[error("bad TOS value (must be 0-255)")]
             BadTos = 21,
             /// `IESETCLIENTAUTH`
-            #[error(
-                "client authentication requires a username, password, and path to a valid RSA public key"
-            )]
             SetClientAuth = 22,
             /// `IESETSERVERAUTH`
-            #[error(
-                "server authentication requires a path to a valid RSA private key and a user credential file"
-            )]
             SetServerAuth = 23,
             /// `IEBADFORMAT`
-            #[error("bad format specifier (valid formats are [kmgtKMGT])")]
             BadFormat = 24,
             /// `IEREVERSEBIDIR`
-            #[error("cannot be both reverse and bidirectional")]
             ReverseBidir = 25,
             /// `IEBADPORT`
-            #[error("port number must be between 1 and 65535")]
             BadPort = 26,
             /// `IETOTALRATE`
-            #[error("total required bandwidth is larger than server limit")]
             TotalRate = 27,
             /// `IETOTALINTERVAL`
-            #[error("invalid time interval for calculating average data rate")]
             TotalInterval = 28,
             /// `IESKEWTHRESHOLD`
-            #[error("skew threshold must be a positive number")]
             SkewThreshold = 29,
             /// `IEIDLETIMEOUT`
-            #[error("idle timeout is not positive or exceeds the allowed limit")]
             IdleTimeout = 30,
             /// `IERCVTIMEOUT`
-            #[error("receive timeout is invalid or out of range")]
             RcvTimeout = 31,
             /// `IERVRSONLYRCVTIMEOUT`
-            #[error("client receive timeout is only valid in receiving mode")]
             ReverseOnlyRcvTimeout = 32,
             /// `IESNDTIMEOUT`
-            #[error("send timeout is invalid or out of range")]
             SndTimeout = 33,
             /// `IEUDPFILETRANSFER`
-            #[error("cannot transfer file using UDP")]
             UdpFileTransfer = 34,
             /// `IESERVERAUTHUSERS`
-            #[error("cannot access authorized users file")]
             ServerAuthUsers = 35,
             /// `IECNTLKA`
-            #[error(
-                "control connection keepalive period must be larger than the full retry period (interval * count)"
-            )]
             CntlKa = 36,
             /// `IEMAXSERVERTESTDURATIONEXCEEDED`
-            #[error("client's requested duration exceeds the server's maximum")]
             MaxServerTestDurationExceeded = 37,
             /// `IEUNITVAL`
-            #[error("invalid unit value or suffix")]
             UnitVal = 38,
             /// `IERVRSONLYSKIPRXCOPY`
-            #[error("this OS does not support --skip-rx-copy")]
             SkipRxCopyUnsupported = 39,
             /// `IEBADDSCP`
-            #[error("bad DSCP value")]
             BadDscp = 40,
             // Test errors
             /// `IENEWTEST`
-            #[error("unable to create a new test")]
             NewTest = 100,
             /// `IEINITTEST`
-            #[error("test initialization failed")]
             InitTest = 101,
             /// `IELISTEN`
-            #[error("unable to start listener for connections")]
             Listen = 102,
             /// `IECONNECT`
-            #[error("unable to connect to server")]
             Connect = 103,
             /// `IEACCEPT`
-            #[error("unable to accept connection from client")]
             Accept = 104,
             /// `IESENDCOOKIE`
-            #[error("unable to send cookie to server")]
             SendCookie = 105,
             /// `IERECVCOOKIE`
-            #[error("unable to receive cookie at server")]
             RecvCookie = 106,
             /// `IECTRLWRITE`
-            #[error("unable to write to the control socket")]
             CtrlWrite = 107,
             /// `IECTRLREAD`
-            #[error("unable to read from the control socket")]
             CtrlRead = 108,
             /// `IECTRLCLOSE`
-            #[error("control socket closed unexpectedly")]
             CtrlClose = 109,
             /// `IEMESSAGE`
-            #[error(
-                "received an unknown control message (ensure the other side is iperf3, not iperf)"
-            )]
             Message = 110,
             /// `IESENDMESSAGE`
-            #[error("unable to send control message")]
             SendMessage = 111,
             /// `IERECVMESSAGE`
-            #[error("unable to receive control message")]
             RecvMessage = 112,
             /// `IESENDPARAMS`
-            #[error("unable to send parameters to server")]
             SendParams = 113,
             /// `IERECVPARAMS`
-            #[error("unable to receive parameters from client")]
             RecvParams = 114,
             /// `IEPACKAGERESULTS`
-            #[error("unable to package results")]
             PackageResults = 115,
             /// `IESENDRESULTS`
-            #[error("unable to send results")]
             SendResults = 116,
             /// `IERECVRESULTS`
-            #[error("unable to receive results")]
             RecvResults = 117,
             /// `IESELECT`
-            #[error("select failed")]
             Select = 118,
             /// `IECLIENTTERM`
-            #[error("the client has terminated")]
             ClientTerm = 119,
             /// `IESERVERTERM`
-            #[error("the server has terminated")]
             ServerTerm = 120,
             /// `IEACCESSDENIED`
-            #[error("the server is busy running a test; try again later")]
             AccessDenied = 121,
             /// `IESETNODELAY`
-            #[error("unable to set TCP/SCTP NODELAY")]
             SetNoDelay = 122,
             /// `IESETMSS`
-            #[error("unable to set TCP/SCTP MSS")]
             SetMss = 123,
             /// `IESETBUF`
-            #[error("unable to set socket buffer size")]
             SetBuf = 124,
             /// `IESETTOS`
-            #[error("unable to set IP TOS")]
             SetTos = 125,
             /// `IESETCOS`
-            #[error("unable to set IPv6 traffic class")]
             SetCos = 126,
             /// `IESETFLOW`
-            #[error("unable to set IPv6 flow label")]
             SetFlow = 127,
             /// `IEREUSEADDR`
-            #[error("unable to set reuse address on socket")]
             ReuseAddr = 128,
             /// `IENONBLOCKING`
-            #[error("unable to set socket to non-blocking")]
             NonBlocking = 129,
             /// `IESETWINDOWSIZE`
-            #[error("unable to set socket window size")]
             SetWindowSize = 130,
             /// `IEPROTOCOL`
-            #[error("protocol does not exist")]
             Protocol = 131,
             /// `IEAFFINITY`
-            #[error("unable to set CPU affinity")]
             Affinity = 132,
             /// `IEDAEMON`
-            #[error("unable to become a daemon")]
             Daemon = 133,
             /// `IESETCONGESTION`
-            #[error(
-                "unable to set TCP_CONGESTION (congestion control algorithm not supported on this host)"
-            )]
             SetCongestion = 134,
             /// `IEPIDFILE`
-            #[error("unable to write PID file")]
             PidFile = 135,
             /// `IEV6ONLY`
-            #[error("unable to set/unset IPV6_V6ONLY")]
             V6Only = 136,
             /// `IESETSCTPDISABLEFRAG`
-            #[error("unable to set SCTP_DISABLE_FRAGMENTS")]
             SetSctpDisableFrag = 137,
             /// `IESETSCTPNSTREAM`
-            #[error("unable to set SCTP_INIT number of SCTP streams")]
             SetSctpNStream = 138,
             /// `IESETSCTPBINDX`
-            #[error("unable to process sctp_bindx() parameters")]
             SetSctpBindx = 139,
             /// `IESETPACING`
-            #[error("unable to set socket pacing rate")]
             SetPacing = 140,
             /// `IESETBUF2`
-            #[error("socket buffer size not set correctly (written value != read value)")]
             BufSizeMismatch = 141,
             /// `IEAUTHTEST`
-            #[error("test authorization failed")]
             AuthTest = 142,
             /// `IEBINDDEV`
-            #[error("unable to bind to device (check permissions)")]
             BindDev = 143,
             /// `IENOMSG`
-            #[error("idle timeout waiting to receive data")]
             NoMsg = 144,
             /// `IESETDONTFRAGMENT`
-            #[error("unable to set IP Do-Not-Fragment flag")]
             SetDontFragment = 145,
             /// `IEBINDDEVNOSUPPORT`
-            #[error("`<ip>%<dev>` is not supported as the system does not support bind to device")]
             BindDevNoSupport = 146,
             /// `IEHOSTDEV`
-            #[error(
-                "host device name (<ip>%<dev>) is only supported (and required) for IPv6 link-local addresses"
-            )]
             HostDev = 147,
             /// `IESETUSERTIMEOUT`
-            #[error("unable to set TCP USER_TIMEOUT")]
             SetUserTimeout = 148,
             /// `IEPTHREADCREATE`
-            #[error("unable to create thread")]
             PthreadCreate = 150,
             /// `IEPTHREADCANCEL`
-            #[error("unable to cancel thread")]
             PthreadCancel = 151,
             /// `IEPTHREADJOIN`
-            #[error("unable to join thread")]
             PthreadJoin = 152,
             /// `IEPTHREADATTRINIT`
-            #[error("unable to initialize thread attributes")]
             PthreadAttrInit = 153,
             /// `IEPTHREADATTRDESTROY`
-            #[error("unable to destroy thread attributes")]
             PthreadAttrDestroy = 154,
             /// `IESETCNTLKA`
-            #[error("unable to set socket keepalive (SO_KEEPALIVE) option")]
             SetCntlKa = 155,
             /// `IESETCNTLKAKEEPIDLE`
-            #[error("unable to set socket keepalive TCP period (TCP_KEEPIDLE) option")]
             SetCntlKaKeepIdle = 156,
             /// `IESETCNTLKAINTERVAL`
-            #[error("unable to set/get socket keepalive TCP retry interval (TCP_KEEPINTVL) option")]
             SetCntlKaInterval = 157,
             /// `IESETCNTLKACOUNT`
-            #[error(
-                "unable to set/get socket keepalive TCP number of retries (TCP_KEEPCNT) option"
-            )]
             SetCntlKaCount = 158,
             /// `IEPTHREADSIGMASK`
-            #[error("unable to change mask of blocked signals")]
             PthreadSigmask = 159,
             /// `IESERVERTESTDURATIONEXPIRED`
-            #[error("server test duration expired")]
             ServerTestDurationExpired = 160,
-            // Stream errors
             /// `IECREATESTREAM`
-            #[error("unable to create a new stream")]
             CreateStream = 200,
             /// `IEINITSTREAM`
-            #[error("unable to initialize stream")]
             InitStream = 201,
             /// `IESTREAMLISTEN`
-            #[error("unable to start stream listener")]
             StreamListen = 202,
             /// `IESTREAMCONNECT`
-            #[error("unable to connect stream")]
             StreamConnect = 203,
             /// `IESTREAMACCEPT`
-            #[error("unable to accept stream connection")]
             StreamAccept = 204,
             /// `IESTREAMWRITE`
-            #[error("unable to write to stream socket")]
             StreamWrite = 205,
             /// `IESTREAMREAD`
-            #[error("unable to read from stream socket")]
             StreamRead = 206,
             /// `IESTREAMCLOSE`
-            #[error("stream socket closed unexpectedly")]
             StreamClose = 207,
             /// `IESTREAMID`
-            #[error("stream has an invalid ID")]
             StreamId = 208,
-            // Timer errors
             /// `IENEWTIMER`
-            #[error("unable to create new timer")]
             NewTimer = 300,
             /// `IEUPDATETIMER`
-            #[error("unable to update timer")]
             UpdateTimer = 301,
         }
+    }
 
-        impl IperfErrno {
-            /// Returns `None` for `IENONE` and codes not known to these bindings.
-            pub fn from_raw(code: c_int) -> Option<Self> {
-                Some(match code {
-                    1 => Self::ServerAndClient,
-                    2 => Self::NoRole,
-                    3 => Self::ServerOnly,
-                    4 => Self::ClientOnly,
-                    5 => Self::Duration,
-                    6 => Self::NumStreams,
-                    7 => Self::BlockSize,
-                    8 => Self::BufSize,
-                    9 => Self::Interval,
-                    10 => Self::Mss,
-                    11 => Self::NoSendfile,
-                    12 => Self::Omit,
-                    13 => Self::Unimplemented,
-                    14 => Self::File,
-                    15 => Self::Burst,
-                    16 => Self::EndConditions,
-                    17 => Self::LogFile,
-                    18 => Self::NoSctp,
-                    19 => Self::Bind,
-                    20 => Self::UdpBlockSize,
-                    21 => Self::BadTos,
-                    22 => Self::SetClientAuth,
-                    23 => Self::SetServerAuth,
-                    24 => Self::BadFormat,
-                    25 => Self::ReverseBidir,
-                    26 => Self::BadPort,
-                    27 => Self::TotalRate,
-                    28 => Self::TotalInterval,
-                    29 => Self::SkewThreshold,
-                    30 => Self::IdleTimeout,
-                    31 => Self::RcvTimeout,
-                    32 => Self::ReverseOnlyRcvTimeout,
-                    33 => Self::SndTimeout,
-                    34 => Self::UdpFileTransfer,
-                    35 => Self::ServerAuthUsers,
-                    36 => Self::CntlKa,
-                    37 => Self::MaxServerTestDurationExceeded,
-                    38 => Self::UnitVal,
-                    39 => Self::SkipRxCopyUnsupported,
-                    40 => Self::BadDscp,
-                    100 => Self::NewTest,
-                    101 => Self::InitTest,
-                    102 => Self::Listen,
-                    103 => Self::Connect,
-                    104 => Self::Accept,
-                    105 => Self::SendCookie,
-                    106 => Self::RecvCookie,
-                    107 => Self::CtrlWrite,
-                    108 => Self::CtrlRead,
-                    109 => Self::CtrlClose,
-                    110 => Self::Message,
-                    111 => Self::SendMessage,
-                    112 => Self::RecvMessage,
-                    113 => Self::SendParams,
-                    114 => Self::RecvParams,
-                    115 => Self::PackageResults,
-                    116 => Self::SendResults,
-                    117 => Self::RecvResults,
-                    118 => Self::Select,
-                    119 => Self::ClientTerm,
-                    120 => Self::ServerTerm,
-                    121 => Self::AccessDenied,
-                    122 => Self::SetNoDelay,
-                    123 => Self::SetMss,
-                    124 => Self::SetBuf,
-                    125 => Self::SetTos,
-                    126 => Self::SetCos,
-                    127 => Self::SetFlow,
-                    128 => Self::ReuseAddr,
-                    129 => Self::NonBlocking,
-                    130 => Self::SetWindowSize,
-                    131 => Self::Protocol,
-                    132 => Self::Affinity,
-                    133 => Self::Daemon,
-                    134 => Self::SetCongestion,
-                    135 => Self::PidFile,
-                    136 => Self::V6Only,
-                    137 => Self::SetSctpDisableFrag,
-                    138 => Self::SetSctpNStream,
-                    139 => Self::SetSctpBindx,
-                    140 => Self::SetPacing,
-                    141 => Self::BufSizeMismatch,
-                    142 => Self::AuthTest,
-                    143 => Self::BindDev,
-                    144 => Self::NoMsg,
-                    145 => Self::SetDontFragment,
-                    146 => Self::BindDevNoSupport,
-                    147 => Self::HostDev,
-                    148 => Self::SetUserTimeout,
-                    150 => Self::PthreadCreate,
-                    151 => Self::PthreadCancel,
-                    152 => Self::PthreadJoin,
-                    153 => Self::PthreadAttrInit,
-                    154 => Self::PthreadAttrDestroy,
-                    155 => Self::SetCntlKa,
-                    156 => Self::SetCntlKaKeepIdle,
-                    157 => Self::SetCntlKaInterval,
-                    158 => Self::SetCntlKaCount,
-                    159 => Self::PthreadSigmask,
-                    160 => Self::ServerTestDurationExpired,
-                    200 => Self::CreateStream,
-                    201 => Self::InitStream,
-                    202 => Self::StreamListen,
-                    203 => Self::StreamConnect,
-                    204 => Self::StreamAccept,
-                    205 => Self::StreamWrite,
-                    206 => Self::StreamRead,
-                    207 => Self::StreamClose,
-                    208 => Self::StreamId,
-                    300 => Self::NewTimer,
-                    301 => Self::UpdateTimer,
-                    _ => return None,
-                })
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn iperf_errno_round_trips() {
+            let mut known = 0;
+            for code in -1..=1000 {
+                if let Some(errno) = IperfErrno::from_raw(code) {
+                    assert_eq!(errno.as_raw(), code, "{errno:?}");
+                    known += 1;
+                }
             }
+            assert_eq!(known, 111);
+        }
 
-            pub fn as_raw(self) -> c_int {
-                self as c_int
+        #[test]
+        fn iperf_errno_rejects_none_and_unknown() {
+            for code in [
+                IENONE,
+                -1,
+                41,
+                99,
+                149,
+                161,
+                209,
+                302,
+                c_int::MIN,
+                c_int::MAX,
+            ] {
+                assert_eq!(IperfErrno::from_raw(code), None, "code {code}");
+            }
+        }
+
+        #[test]
+        fn iperf_errno_matches_header_values() {
+            let cases = [
+                (1, IperfErrno::ServerAndClient),
+                (40, IperfErrno::BadDscp),
+                (100, IperfErrno::NewTest),
+                (103, IperfErrno::Connect),
+                (121, IperfErrno::AccessDenied),
+                (160, IperfErrno::ServerTestDurationExpired),
+                (200, IperfErrno::CreateStream),
+                (208, IperfErrno::StreamId),
+                (300, IperfErrno::NewTimer),
+                (301, IperfErrno::UpdateTimer),
+            ];
+            for (code, errno) in cases {
+                assert_eq!(IperfErrno::from_raw(code), Some(errno));
+                assert_eq!(errno.as_raw(), code);
             }
         }
     }
