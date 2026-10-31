@@ -63,6 +63,24 @@ impl IperfTest {
         unsafe { bind::iperf_set_test_server_port(self.test_ptr.as_ptr(), port.into()) }
     }
 
+    //iperf_set_test_bind_address
+    pub fn set_test_bind_address(
+        &self,
+        bind_address: impl AsRef<str>,
+    ) -> Result<(), error::IperfTestError> {
+        let bind_address = CString::new(bind_address.as_ref())
+            .context("failed to marshall CString")
+            .map_err(error::IperfTestError::DataMarshalling)?;
+        let bind_address: *const c_char = bind_address.as_ptr();
+
+        // SAFETY: test_ptr is NonNull, allocated in new, and only freed on drop
+        unsafe {
+            bind::iperf_set_test_server_hostname(self.test_ptr.as_ptr(), bind_address);
+        }
+
+        Ok(())
+    }
+
     pub fn set_test_duration(&self, duration: Duration) -> Result<(), error::IperfTestError> {
         // SAFETY: test_ptr is NonNull, allocated in new, and only freed on drop
         unsafe {
@@ -132,6 +150,7 @@ impl IperfTest {
     ) -> Result<(), error::IperfTestError> {
         // SAFETY: `closure` will be dropped at the end of this function, same as `self`.
         unsafe {
+            bind::iperf_set_test_json_output(self.test_ptr.as_ptr(), 1);
             bind::iperf_set_test_json_stream(self.test_ptr.as_ptr(), 1);
             bind::iperf_set_test_json_callback(
                 self.test_ptr.as_ptr(),
@@ -144,7 +163,7 @@ impl IperfTest {
             }
         };
 
-        todo!()
+        Ok(())
     }
 }
 
@@ -159,6 +178,7 @@ impl Drop for IperfTest {
 
 pub enum TestRole {
     Client,
+    #[allow(dead_code)]
     Server,
 }
 
@@ -192,6 +212,7 @@ pub mod event {
                 .recv()
                 .map_err(|_| error::EventReceiveError::EventStreamOver)?
                 .map_err(|e| error::EventReceiveError::ParseError(e.into()))?;
+            log::trace!("Event RX: {}", event_str);
             serde_json::from_str(&event_str)
                 .map_err(|e| error::EventReceiveError::ParseError(e.into()))
         }
