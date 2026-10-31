@@ -212,7 +212,7 @@ pub mod event {
                 .recv()
                 .map_err(|_| error::EventReceiveError::EventStreamOver)?
                 .map_err(|e| error::EventReceiveError::ParseError(e.into()))?;
-            log::trace!("Event RX: {}", event_str);
+            log::trace!("Raw event RX: {}", event_str);
             serde_json::from_str(&event_str)
                 .map_err(|e| error::EventReceiveError::ParseError(e.into()))
         }
@@ -231,51 +231,51 @@ pub mod event {
 
     #[derive(Debug, Deserialize)]
     pub struct Interval {
-        streams: Vec<IntervalStream>,
-        sum: IntervalSum,
+        pub streams: Vec<IntervalStream>,
+        pub sum: IntervalSum,
     }
 
     #[derive(Debug, Deserialize)]
     pub struct IntervalStream {
-        socket: i32,
-        start: f64,
-        end: f64,
-        bytes: u64,
-        bits_per_second: f64,
+        pub socket: i32,
+        pub start: f64,
+        pub end: f64,
+        pub bytes: u64,
+        pub bits_per_second: f64,
         #[serde(default)]
-        retransmits: Option<i64>,
+        pub retransmits: Option<i64>,
         #[serde(default)]
-        rtt: Option<u32>,
+        pub rtt: Option<u32>,
         #[serde(default)]
-        jitter_ms: Option<f64>,
+        pub jitter_ms: Option<f64>,
         #[serde(default)]
-        lost_percent: Option<f64>,
-        omitted: bool,
-        sender: bool,
+        pub lost_percent: Option<f64>,
+        pub omitted: bool,
+        pub sender: bool,
     }
 
     #[derive(Debug, Deserialize)]
     pub struct IntervalSum {
-        start: f64,
-        end: f64,
-        bytes: u64,
-        bits_per_second: f64,
-        omitted: bool,
+        pub start: f64,
+        pub end: f64,
+        pub bytes: u64,
+        pub bits_per_second: f64,
+        pub omitted: bool,
     }
 
     #[derive(Debug, Deserialize)]
     pub struct End {
-        sum_sent: Option<Sum>,
-        sum_received: Option<Sum>,
+        pub sum_sent: Option<Sum>,
+        pub sum_received: Option<Sum>,
     }
 
     #[derive(Debug, Deserialize)]
     pub struct Sum {
-        seconds: f64,
-        bytes: u64,
-        bits_per_second: f64,
+        pub seconds: f64,
+        pub bytes: u64,
+        pub bits_per_second: f64,
         #[serde(default)]
-        retransmits: Option<i64>,
+        pub retransmits: Option<i64>,
     }
 
     pub mod error {
