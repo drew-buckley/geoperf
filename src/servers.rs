@@ -1,10 +1,11 @@
 use ahash::HashMap;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use toshi::City;
 
 const SERVER_SOURCE: &str = "http://export.iperf3serverlist.net/listed_iperf3_servers.json";
 
-pub fn fetch() -> Result<HashMap<String, Iperf3Server>, anyhow::Error> {
+pub fn fetch() -> Result<HashMap<City, Iperf3Server>, anyhow::Error> {
     log::debug!("GET {}", SERVER_SOURCE);
     let mut body = ureq::get(SERVER_SOURCE)
         .call()
@@ -15,9 +16,9 @@ pub fn fetch() -> Result<HashMap<String, Iperf3Server>, anyhow::Error> {
     let servers: Vec<Iperf3Server> =
         serde_json::from_str(&json_str).context("failed to parse JSON server list")?;
 
-    Ok(HashMap::from_iter(
-        servers.into_iter().map(|s| (s.site.clone(), s)),
-    ))
+    Ok(HashMap::from_iter(servers.into_iter().filter_map(|s| {
+        City::try_new(&s.site, &s.country_code).map(|c| (c, s))
+    })))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,7 +34,7 @@ pub struct Iperf3Server {
     #[serde(rename = "CONTINENT")]
     pub continent: String,
     #[serde(rename = "COUNTRY")]
-    pub country: String,
+    pub country_code: String,
     #[serde(rename = "SITE")]
     pub site: String,
     #[serde(rename = "PROVIDER")]

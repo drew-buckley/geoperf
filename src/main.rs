@@ -10,6 +10,7 @@ use geoperf::{
     iperf3::IperfClient,
     servers::{self, Iperf3Server},
 };
+use toshi::City;
 
 #[derive(Clone, FromArgs)]
 /// iperf3 to public servers based on geography
@@ -17,6 +18,10 @@ struct Args {
     /// target city of public server
     #[argh(option, short = 'c')]
     city: String,
+
+    /// country code of target city
+    #[argh(option, default = "default_country_code()")]
+    country_code: String,
 
     /// interface to bind on client side
     #[argh(option, short = 'b', default = "default_bind()")]
@@ -38,17 +43,20 @@ fn run() -> Result<(), anyhow::Error> {
     env_logger::init();
     let args: Args = argh::from_env();
 
+    let target_city =
+        City::try_new(args.city, args.country_code).context("country code must be 2 characters")?;
+
     let servers = servers::fetch().context("failed to fetch server list")?;
     let cities =
         toshi::cities(toshi::DatabaseId::Cities1000).context("failed to get city database")?;
     let proximate_cities = cities
-        .calculate_proximities(args.city)
+        .calculate_proximities(&target_city)
         .context("city not found in database")?;
-    for (d, server) in proximate_cities
+    for (d, city, server) in proximate_cities
         .iter()
-        .filter_map(|(d, c)| servers.get(*c).map(|c| (d, c)))
+        .filter_map(|(d, c)| servers.get(*c).map(|s| (d, c, s)))
     {
-        let coordinates = cities.get(&server.site).unwrap();
+        let coordinates = cities.get(city).unwrap();
         log::trace!(
             "Matching server: {} ({}; {},{})",
             server.site,
@@ -70,7 +78,7 @@ fn run() -> Result<(), anyhow::Error> {
 }
 
 fn test(server: &Iperf3Server) -> Result<(), anyhow::Error> {
-    log::info!("Testing against: {}, {}", server.site, server.country);
+    log::info!("Testing against: {}, {}", server.site, server.country_code);
     let client = IperfClient::try_new(
         &server.host,
         server
@@ -85,4 +93,8 @@ fn test(server: &Iperf3Server) -> Result<(), anyhow::Error> {
 
 fn default_bind() -> SocketAddr {
     SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()
+}
+
+fn default_country_code() -> String {
+    "US".into()
 }
